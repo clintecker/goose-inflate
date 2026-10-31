@@ -1,0 +1,60 @@
+# Goose idioms for the tools in this repository
+
+Written 2026-10-24 against release v2026.3 by reading the tutorial, reference and stdlib docs and compiling every snippet marked verified. When the pinned release changes (`.goose-version`), re-verify the snippets and update this file in the same PR. The upstream docs ship in the release under `docs/` next to the `goose` binary; they are the source of truth and this file is the digest.
+
+
+---
+
+## 0. Toolchain facts you need before writing a line
+
+- `goose file.goose [-- args...]` compiles in-process (TinyCC) and runs. `goose check file.goose`
+  typechecks only (exit 0 on success, 1 on error). `goose build file.goose` makes an executable
+  beside the source (`-o path` elsewhere). `goose run` == bare form. Threads need `goose build`.
+- **The compiler prints progress lines to stderr** (`parsed ok: ...`, `typechecked ok: ...`,
+  `bce: elided ...`) even on a successful run. They are on stderr, not stdout, so piping the
+  program's stdout is clean; stderr of a tool run via `goose x.goose` is polluted. For real CLI
+  tools, `goose build` and run the binary (the binary prints nothing extra).
+- Exit codes: `exit(n)` -> n. `abort("msg")` prints `goose runtime error: msg (file:line)` to
+  stderr and exits 1. Failed `assert` -> `goose runtime error: assert failed (file:line)`, exit 1.
+  A compile error -> exit 1. Normal return from `main` -> 0.
+- `--debug` adds overflow/range checks. `-O0/-O1/-O2` inlining level.
+- There is **no package manifest / project file**. A program is one *root file* named on the
+  command line plus whatever it `import`s (whole-program compilation). Optional `foo.build`
+  sidecar only for C sources. Packages from git are declared only in the root file
+  (`import name from "owner/repo@v1";`), see section 1.
+- Semicolons: expression statements end in `;`. `if`/`match`/`block`/loops/`guard ... else {}`/
+  nested `fn`/a call with a trailing block need none (a stray `;` is harmless, and samples put
+  `;` after `each_split(...) { ... };`). Trailing commas allowed everywhere.
+- Comments `//` and nestable `/* */`. Identifiers `[A-Za-z_][A-Za-z0-9_]*`.
+- Naming conventions seen in stdlib/samples: `snake_case` functions and variables,
+  `CapCase` structs/enums/variants, `UPPER` for named constants (`let SIZE = 16;`), lowercase
+  struct names in stdlib (`dictionary`, `rng`). Files `snake_case.goose`.
+
+---
+
+## 1. Program skeleton
+
+```goose
+// tool.goose  (root file)
+import std;          // strings, arrays, parse_int, sort, ...  (names are GLOBAL)
+import os;           // args, stdin, files, env, exit-related I/O  (names are GLOBAL)
+import dictionary;   // dictionary<K, V>  (GLOBAL)
+import json;         // namespaced: json::parse, json::reader ...
+import csv;          // namespaced: csv::each_record
+import regex;        // namespaced: regex::compile
+import exception;    // namespaced: exception::try / exception::throw
+import util;         // your own ./util.goose (relative to the ROOT file's directory)
+import lib.text;     // ./lib/text.goose
+import .sibling;     // leading dot: relative to THIS file, not the root
+
+fn main() {          // entry point; must be in the global namespace of the root file
+    ...
+}
+```
+
+Facts (reference.md §21, verified in `snippets/multi/`):
+
+- `import a.b.c;` loads `a/b/c.goose` once; resolution order: relative to the root file's
+  directory, then a declared package's module, then the stdlib dir. **An import creates no
+  namespace and brings nothing into scope beyond what the file declares.** Names are global
+  unless the file says `namespace foo;` at its top, after which callers write `foo::name`,

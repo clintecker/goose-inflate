@@ -1,51 +1,59 @@
 # clintecker/goose-inflate
 
-DEFLATE (RFC 1951) and gzip (RFC 1952) decoding for [Goose](https://github.com/aardappel/goose), as a decoder the caller pulls from, and CRC-32. Memory stays bounded however far a stream expands: a step stops at the end of a block or once 1 MB waits untaken, and only the 32 KB window a later copy may reach is kept.
+DEFLATE (RFC 1951) and gzip (RFC 1952) decoding for [Goose](https://github.com/aardappel/goose), fed compressed pieces of any size, and CRC-32. The state is one record of fixed-size arrays you own: nothing is allocated, nothing is read or written, and an error comes back as `false` with an offset and a reason, so the decoder sits between a file, a network buffer or an archive reader and whatever reads its output.
 
 ```goose
-import inflate from "clintecker/goose-inflate@v1";
-import file from "clintecker/goose-file@v1";
+import inflate from "clintecker/goose-inflate@v2";
 
-let f = file::file_open("notes.txt.gz");
-var s = inflate::Bits { who: "mytool", f: f, data: [] };   // or f 0 and the bytes in s.data
-var o = inflate::Out { data: [] };
-var z = inflate::Inflater { lc: inflate::Huff { .. }, dc: inflate::Huff { .. } };
-inflate::gzip_header(s);
-while inflate::step(z, s, o) {
-    write_stdout(inflate::take(o, inflate::avail(o)));
-    inflate::compact(o);
+var z = inflate::gzip_start();             // inflate::start() for raw DEFLATE, as in a ZIP entry
+for piece in pieces {
+    let ok = inflate::add(z, piece) { out, ended => write_stdout(out); };
+    if !ok { break; }
 }
-let ok = inflate::whole_bytes(s, 4) == inflate::crc(o);   // the gzip trailer's CRC-32
+if !inflate::finish(z) {                    // the stream ended, and the gzip trailer matched
+    var why: u8[>..] = [];
+    inflate::reason(why, z);
+    print("byte ", z.err_at, ": ", why);
+}
 ```
 
-`test/inflate_test.goose` runs this on a file made by `gzip -9`, from a file handle and from bytes in memory.
+## Functions
 
-## Types and functions
-
-| Name | What it is |
+| Function | What it does |
 |---|---|
-| `Bits` | the input: a [clintecker/goose-file](https://github.com/clintecker/goose-file) handle `f` read 64 KB at a time, or `f` 0 and all the bytes in `data`; `who` names the program in error messages |
-| `Out` | the output: decoded bytes in `data`, those not yet taken, the running CRC-32 and the total |
-| `Inflater` | where decoding is: the block kind, whether it is inside a block, the code tables |
-| `step(z, s, o) -> bool` | decodes until a block ends or 1 MB waits untaken; false after the last block |
-| `avail(o)`, `take(o, n)` | bytes decoded and not yet taken; the next `n` of them as a slice, counted into the CRC-32 |
-| `compact(o)` | drops what was taken, keeping the 32 KB window |
-| `crc(o)`, `o.total` | the CRC-32 and the number of bytes taken |
-| `gzip_header(s)` | reads and checks a gzip member header, skipping its optional fields |
-| `whole_bytes(s, n)` | the next `n` bytes as a little-endian integer, from a byte boundary (a gzip trailer) |
-| `bits_in(s)`, `kind_name(z.kind)` | input bits used so far, and "stored", "fixed" or "dynamic", for a per-block report |
-| `crc32(bytes) -> i64`, `crc32_update(c, bytes) -> u32` | CRC-32 as PNG, ZIP and gzip define it; the second continues a register over data that arrives in pieces |
+| `start() -> Inflate` | a decoder for a raw DEFLATE stream |
+| `gzip_start() -> Inflate` | a decoder for a gzip member: header, DEFLATE data, then the trailer's CRC-32 and length, checked |
+| `add(z, piece) { out, ended => ... } -> bool` | decodes the next piece, from one byte up; calls the block with each run of output, a view into the decoder's window valid for the call, and with `ended` true as a block ends; false once the data are malformed, and every later call is false too |
+| `finish(z) -> bool` | the end of the input: true if the stream ended (and, for gzip, its trailer matched) |
+| `reason(out, z)` | what went wrong, as a sentence; `z.err_at` is the offset in the compressed data |
+| `crc(z)`, `z.made`, `z.at` | the CRC-32 and count of the output so far, and the compressed bytes used |
+| `z.blocks`, `z.kind`, `z.block_from`, `z.block_to`, `kind_name(k)` | blocks ended, the last one's kind and the input bits it began and ended at, for a per-block report |
+| `crc32(bytes) -> i64`, `crc32_update(c, bytes) -> u32` | CRC-32 as PNG, ZIP and gzip define it; the second continues a register over data that arrive in pieces |
 
 The other functions are the decoder's steps; Goose has no private functions, so they are visible, but they are not part of the interface.
 
+The same stream gives the same output, block ends and error offset however it is cut into pieces: `test/inflate_test.goose` checks every stream whole and in pieces of 1, 7 and 65,536 bytes.
+
+## How
+
+Decoding goes in units: a block header, a code length, one literal or length and distance pair, a run of a stored block. Each unit reads all the bits it needs before it changes anything, at most 10 bytes, so when a piece runs out inside one the unit is undone and its bytes are carried, at most 15, into the next piece. Output goes into a 64 KB window in the state; when it nears full, what is new is handed to the block and the last 32 KB, all a later copy may reach, move to the front. Huffman codes are decoded a bit at a time, as Mark Adler's puff.c does.
+
 ## Errors
 
-Corrupt input prints `<who>: <what is wrong>` to stderr and exits with 65 (`EX_DATAERR`); a read error on the handle exits with 66 (`EX_NOINPUT`). The decoder does not return errors to the caller.
+`add` and `finish` return false, `z.why` says which, and `reason` writes it, in the words v1 printed: `compressed data ends early`, `block type 3 is reserved`, `stored block length does not match its complement`, `no Huffman code matches`, `bad length code`, `bad distance code`, `a distance reaches before the start of the output`, `a repeat code comes before any length`, `code lengths run past their count`, `bad literal/length code lengths`, `bad distance code lengths`, `too many length or distance codes`, `bad code-length code`, `no end-of-block code`, `not a gzip file`, `compression method N is not deflate`, `reserved header flag bits are set`, `CRC-32 is 0x…, the file records 0x…`, `length is N, the file records M`.
 
 ## Limits
 
-- Decoding only; no compression. No zlib wrapper and no ZIP container, though a ZIP entry's DEFLATE data decodes with `f` 0 and the entry's bytes in `data`.
-- Huffman codes are decoded a bit at a time, as Mark Adler's puff.c does: simple and checked, not the fastest.
-- The package requires clintecker/goose-file, so a program that uses only `crc32` still declares it.
+- Decoding only; no compression, and no zlib wrapper.
+- A gzip decoder reads one member; bytes after its trailer are not read.
+- Huffman codes are decoded a bit at a time: simple and checked, not the fastest.
+
+## Versions
+
+v1 (`@v1`) is a pull decoder over a [clintecker/goose-file](https://github.com/clintecker/goose-file) handle that exits the program on corrupt data. v2 takes pieces and returns errors, and needs no other package.
+
+## Tests
+
+From the package root: `goose run test/inflate_test.goose`. `python3 test/make_data.py` rebuilds the raw DEFLATE data with Python's zlib; the .gz files were made by gzip.
 
 MIT licence (LICENSE).
