@@ -13,7 +13,7 @@ import .crc32;
 // What went wrong. `reason` gives each one's message.
 enum Why { None, Truncated, BlockType, StoredLength, NoCode, LengthCode, DistanceCode, TooFar,
            RepeatFirst, LengthsOver, BadLiteralLengths, BadDistanceLengths, TooMany, BadCodeLengths,
-           NoEndCode, NotGzip, Method, Reserved, Crc, Length }
+           NoEndCode, NotGzip, Method, Reserved, Crc, Length, Trailing }
 
 enum Kind { Stored, Fixed, Dynamic }
 
@@ -31,6 +31,7 @@ let IN_LENS = 5;       // a dynamic block's literal/length and distance code len
 let IN_CODES = 6;      // a coded block's symbols
 let IN_TRAILER = 7;    // the gzip trailer
 let IN_END = 8;
+let IN_NEXT = 9;      // after a gzip trailer: zero bytes, or the next member
 
 // What a run over the input stopped for.
 let GO = 0;            // a unit is done; go on
@@ -69,6 +70,8 @@ struct Inflate {
     flags: i64,                     // the gzip header flags whose fields are still to read
     nlen: i64, ndist: i64, ncode: i64, index: i64,
     made: i64,                      // bytes decoded
+    before: i64,                    // bytes decoded before this gzip member
+    members: i64,                   // gzip members whose trailer matched
     pos: i64, sent: i64,            // the window's end, and how far it was handed over
     crc: u32,
     blocks: i64,                    // blocks ended
@@ -84,12 +87,14 @@ struct Inflate {
 fn start() -> Inflate {
     return Inflate { phase: IN_BLOCK, gzip: false, last: false, kind: Kind.Stored, at: 0, i: 0, stop: -1, buf: 0, cnt: 0,
                      mbuf: 0, mcnt: 0, mat: 0, left: 0, flags: 0, nlen: 0, ndist: 0, ncode: 0, index: 0,
-                     made: 0, pos: 0, sent: 0, crc: 0xffffffff, blocks: 0, block_from: 0, block_to: 0,
+                     made: 0, before: 0, members: 0, pos: 0, sent: 0, crc: 0xffffffff, blocks: 0, block_from: 0, block_to: 0,
                      err_at: -1, why: Why.None, err_a: 0, err_b: 0, lengths: [0; 316],
                      clh: Huff { .. }, lc: Huff { .. }, dc: Huff { .. }, carry: [], join: [], win: [0; 65536] };
 }
 
-// A gzip stream: header, DEFLATE data, then the trailer's CRC-32 and length.
+// A gzip stream: members, each a header, DEFLATE data, then the trailer's
+// CRC-32 and length, until the input ends. Zero bytes after a trailer are
+// padding.
 fn gzip_start() -> Inflate {
     var z = start();
     z.phase = IN_GZIP;
@@ -97,7 +102,7 @@ fn gzip_start() -> Inflate {
     return z;
 }
 
-// The CRC-32 of the bytes decoded so far.
+// The CRC-32 of the bytes decoded so far; for gzip, so far in this member.
 fn crc(z: Inflate&) -> i64 { z.crc ^ 0xffffffff }
 
 // Bits of input used so far.
@@ -128,6 +133,7 @@ fn say(out: u8[>..]&, w: Why.NotGzip,            z: Inflate&) { out.append("not 
 fn say(out: u8[>..]&, w: Why.Reserved,           z: Inflate&) { out.append("reserved header flag bits are set"); }
 fn say(out: u8[>..]&, w: Why.Method, z: Inflate&) { format(out, "compression method ", z.err_a, " is not deflate"); }
 fn say(out: u8[>..]&, w: Why.Length, z: Inflate&) { format(out, "length is ", z.err_a, ", the file records ", z.err_b); }
+fn say(out: u8[>..]&, w: Why.Trailing, z: Inflate&) { format(out, "the bytes after gzip member ", z.members, " are not a gzip member"); }
 fn say(out: u8[>..]&, w: Why.Crc, z: Inflate&) {
     out.append("CRC-32 is ");
     hex8(out, z.err_a);
@@ -160,11 +166,11 @@ fn add<F>(z: Inflate&, piece: const u8[:]) -> bool {
     return drive(z, piece[from..]) { out, ended => F(out, ended); } != BAD;
 }
 
-// The end of the input: true if the stream ended, and for gzip its
-// trailer matched.
+// The end of the input: true if the stream ended, and for gzip if each
+// member's trailer matched and no member is cut short.
 fn finish(z: Inflate&) -> bool {
     guard z.why == Why.None else { return false; }
-    if z.phase != IN_END { z.err_at = z.at; z.why = Why.Truncated; return false; }
+    if z.phase != IN_END && z.phase != IN_NEXT { z.err_at = z.at; z.why = Why.Truncated; return false; }
     return true;
 }
 
@@ -274,6 +280,7 @@ fn unit(z: Inflate&, d: const u8[:]) -> i64 {
     if z.phase == IN_GZIP { return gzip_header(z, d); }
     if z.phase == IN_FIELDS { return gzip_field(z, d); }
     if z.phase == IN_TRAILER { return trailer(z, d); }
+    if z.phase == IN_NEXT { return next_member(z, d); }
     return DONE;
 }
 
@@ -388,7 +395,7 @@ fn symbol(z: Inflate&, d: const u8[:]) -> i64 {
     let ds = decode(z, d, z.dc);
     if ds >= 30 { corrupt(z, Why.DistanceCode); }
     let dist = DBASE[ds] + bits(z, d, DEXT[ds]);
-    if dist > z.made { corrupt(z, Why.TooFar); }
+    if dist > z.made - z.before { corrupt(z, Why.TooFar); }
     for _ in len { z.win[z.pos] = z.win[z.pos - dist]; z.pos++; }
     z.made += len;
     return GO;
@@ -481,8 +488,8 @@ fn gzip_header(z: Inflate&, d: const u8[:]) -> i64 {
     let cm = bits(z, d, 8);
     let flg = bits(z, d, 8);
     for _ in 3 { bits(z, d, 16); }
-    if id != 0x8b1f { corrupt(z, Why.NotGzip); }
-    if cm != 8 { fail_at(z, 2, Why.Method, cm, 0); return BAD; }
+    if id != 0x8b1f { corrupt(z, if z.members > 0 { Why.Trailing } else { Why.NotGzip }); }
+    if cm != 8 { fail_at(z, z.mat + 2, Why.Method, cm, 0); return BAD; }
     if (flg & 0xe0) != 0 { corrupt(z, Why.Reserved); }
     z.flags = flg;
     z.phase = IN_FIELDS;
@@ -511,13 +518,30 @@ fn skip(z: Inflate&, d: const u8[:]) -> i64 {
     return GO;
 }
 
-// The CRC-32 and length of the decoded data, checked against all of it.
+// The CRC-32 and length of the member's decoded data, checked against all
+// of it.
 fn trailer(z: Inflate&, d: const u8[:]) -> i64 {
     align(z);
     let want = bits(z, d, 32);
     let size = bits(z, d, 32);
+    let n = z.made - z.before;
     if crc(z) != want { fail_at(z, z.at - 8, Why.Crc, crc(z), want); return BAD; }
-    if (z.made & 0xffffffff) != size { fail_at(z, z.at - 4, Why.Length, z.made, size); return BAD; }
-    z.phase = IN_END;
-    return DONE;
+    if (n & 0xffffffff) != size { fail_at(z, z.at - 4, Why.Length, n, size); return BAD; }
+    z.members++;
+    z.phase = IN_NEXT;
+    return GO;
+}
+
+// After a trailer: a zero byte, which is padding, or the start of the next
+// member, which is read again as its header. A member is decoded on its
+// own: its CRC-32 and length start over, and no distance reaches into the
+// members before it.
+fn next_member(z: Inflate&, d: const u8[:]) -> i64 {
+    if bits(z, d, 8) == 0 { return GO; }
+    undo(z, d);
+    z.crc = 0xffffffff;
+    z.before = z.made;
+    z.last = false;
+    z.phase = IN_GZIP;
+    return GO;
 }

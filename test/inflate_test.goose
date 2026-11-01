@@ -32,8 +32,9 @@ fn decode(data: const u8[:], size: i64, gzip: bool) -> u8[>..] {
     return out;
 }
 
-fn same_every_way(name: const u8[:], gzip: bool) -> u8[>..] {
-    let data = read(name);
+fn same_every_way(name: const u8[:], gzip: bool) -> u8[>..] { every_way(name, read(name), gzip) }
+
+fn every_way(name: const u8[:], data: const u8[:], gzip: bool) -> u8[>..] {
     let whole = decode(data, data.len, gzip);
     for size in [1, 7, 65536] {
         if decode(data, size, gzip) != whole { print(name, ": pieces of ", size, " differ"); assert(false); }
@@ -42,6 +43,38 @@ fn same_every_way(name: const u8[:], gzip: bool) -> u8[>..] {
 }
 
 fn tail(s: const u8[:]) -> const u8[:] { s[rfind(s, "\n-- ") + 1..] }
+
+// Members one after another, as `cat a.gz b.gz` writes them; zero bytes
+// after a trailer; other bytes after one; and a second member whose
+// distances reach into the first (zdict.gz), which gzip refuses.
+fn members() {
+    let a = read("sample.txt.gz");
+    let b = read("text.gz");
+    var two: u8[>..] = [];
+    two.append(a);
+    two.append(b);
+    var want: u8[>..] = [];
+    want.append(read("sample.txt"));
+    want.append(read("text.txt"));
+    let got = every_way("two", two, true);
+    assert(got[..rfind(got, "\n-- ")] == want);
+    assert(find(tail(got), "byte ") < 0);
+    var padded: u8[>..] = [];
+    padded.append(b);
+    for _ in 100 { padded.push(0); }
+    let p = every_way("padded", padded, true);
+    assert(p[..rfind(p, "\n-- ")] == read("text.txt"));
+    assert(find(tail(p), "byte ") < 0);
+    var junk: u8[>..] = [];
+    junk.append(b);
+    junk.append("garbage after");
+    assert(ends_with(every_way("junk", junk, true), str("byte ", b.len, ": the bytes after gzip member 1 are not a gzip member")));
+    var cut: u8[>..] = [];
+    cut.append(b);
+    cut.append(a[..5]);
+    assert(ends_with(every_way("cut", cut, true), "compressed data ends early"));
+    assert(ends_with(same_every_way("zdict.gz", true), "a distance reaches before the start of the output"));
+}
 
 fn main() {
     assert(inflate::crc32("123456789") == 0xcbf43926);
@@ -64,5 +97,6 @@ fn main() {
     assert(ends_with(same_every_way("short.gz", true), "compressed data ends early"));
     assert(ends_with(same_every_way("reserved.gz", true), "byte 0: reserved header flag bits are set"));
     assert(ends_with(same_every_way("text.txt", true), "byte 0: not a gzip file"));
+    members();
     print("inflate_test: ok");
 }
